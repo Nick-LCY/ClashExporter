@@ -16,5 +16,5 @@
 
 ## 清单
 - [[architecture/decisions/0001-单表全维度计数器.md]] — 核心指标只保留一张全维度表，维度切片交给 PromQL 聚合
-- [[architecture/decisions/0002-无损淘汰与重锚.md]] — 24 小时无增量即停导但保留数据，重锚续报保证 `increase()` 零丢失
+- [[architecture/decisions/0002-无损淘汰与重锚.md]] — 24 小时无增量即停导但保留数据，重锚续报保证 `increase()` 零丢失，并按 `prune_ttl` 无损裁剪过期条目
 - [[architecture/decisions/0003-JSON快照持久化.md]] — 账本 JSON 原子快照，重启后计数器不归零
