@@ -169,7 +169,8 @@ status: todo
 3. 实现三个归一化方法：
    - `resolveDevice`：别名命中用别名，否则用原始 IP。
    - `resolveSite`：空值归 `unresolved`；按顺序取首条命中的归组规则用其归组名；否则取 `host` 小写去空格；IP 字面量（含 `198.18.0.0/15` 段）归 `unresolved`。
-   - `resolveProxy`：取 `chains` 末元素；`DIRECT` 归 `direct`；`REJECT` 归 `reject`；空链归 `unknown`。
+   - `resolveProxy`：取 `chains` 首元素（实际出口节点），末元素为策略组、不单独暴露；`DIRECT` 归 `direct`；`REJECT` 归 `reject`；空链归 `unknown`。
+   - 实测依据（2026-10-26，真实 mihomo v1.19.30 的 `/connections`）：`chains` 数组顺序为 `[真实出口节点, 策略组]`，样例 `["🇭🇰 E-香港2", "KyCloud"]` ×6、`["🇭🇰 E-香港5", "KyCloud"]` ×1、`["DIRECT"]` ×23；即首元素才是实际出口节点，末元素是策略组名。
    - 验收：别名命中、归组首条命中、`host` 缺失、IP 字面量、代理归一化各有测试。
 4. 实现 `func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse)`，顺序固定：
    - ① 活跃连接增量入账 → ② 消失连接残余补账 → ③ 淘汰扫描 → ④ 全局对账值更新。

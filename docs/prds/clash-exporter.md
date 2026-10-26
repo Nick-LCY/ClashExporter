@@ -50,7 +50,7 @@ mihomo 的 `/connections` API 只暴露**当前活跃连接**的列表，每条�
 |---|---|---|
 | `device` | 连接的 `sourceIP` | TUN 旁路由模式下即局域网客户端真实 IP（EasyTier 远程设备为其 VPN 网段 IP）；路由器本机自身发起的流量（`type=Tun`）源 IP 为 TUN 网关地址 `198.18.0.1`，通过 `device_aliases` 起别名（如「旁路由本机」）归入独立设备，不视为设计变更；配置支持 IP → 别名映射，命中别名则用别名，否则用原始 IP |
 | `site` | 连接的 `host`（嗅探到的域名） | 空、或为 IP 字面量（含 fake-ip 保留段 `198.18.0.0/15`）一律归入 `unresolved` 桶；**绝不**用 `destinationIP` 充当站点标签；支持正则归组规则，按顺序取首条命中的规则归组名 |
-| `proxy` | 连接的代理链 `chains` 末端 | 取最后一个元素作为真实出口节点；`DIRECT` / `REJECT` 归一化为小写 `direct` / `reject`；空链归 `unknown` |
+| `proxy` | 连接的代理链 `chains` 首元素 | 取第一个元素作为真实出口节点（2026-10-26 实测：顺序为 `[真实出口节点, 策略组]`，末元素是策略组名，不单独暴露）；`DIRECT` / `REJECT` 归一化为小写 `direct` / `reject`；空链归 `unknown` |
 
 站点标签集合去重上限默认 10000，超限的新站点归入 `other` 桶，`other` 本身不占配额。
 
