@@ -24,4 +24,4 @@
 ```
 
 ## 清单
-- （暂无）
+- [[prds/clash-exporter.md]] — ClashExporter：mihomo 流量 Prometheus exporter（首份 PRD，设计已定稿）
