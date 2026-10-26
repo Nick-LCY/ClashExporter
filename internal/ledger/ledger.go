@@ -30,10 +30,10 @@ const (
 	// ProxyUnknown 是代理链为空时的占位标签。
 	ProxyUnknown = "unknown"
 
-	// ProxyDirect 是直连（chains 末端为 DIRECT）的归一化标签。
+	// ProxyDirect 是直连（chains 首元素为 DIRECT）的归一化标签。
 	ProxyDirect = "direct"
 
-	// ProxyReject 是拒绝（chains 末端为 REJECT）的归一化标签。
+	// ProxyReject 是拒绝（chains 首元素为 REJECT）的归一化标签。
 	ProxyReject = "reject"
 
 	// DeviceUnknown 是连接缺少源 IP 时的占位标签。
@@ -524,22 +524,32 @@ func (l *Ledger) resolveSite(host string) string {
 	return h
 }
 
-// resolveProxy 取代理链末端作为出口节点：DIRECT / REJECT 归一化，空链归 unknown。
+// resolveProxy 取代理链首元素作为实际出口节点：DIRECT / REJECT 归一化，空链归 unknown。
+//
+// 顺序依据（2026-10-26 对真实 mihomo v1.19.30（192.168.2.2:9090）的 /connections 实测）：
+// chains 数组的排列是 [实际出口节点, 策略组]，例如
+//
+//	["🇭🇰 E-香港2", "KyCloud"]  6 条
+//	["🇭🇰 E-香港5", "KyCloud"]  1 条
+//	["DIRECT"]                23 条
+//
+// 即首元素是真实出口、末元素是策略组名。取末元素会把全部代理流量归到策略组名下，
+// 破坏按节点统计的核心需求。改动此函数前请先复核真实数据，不要改回取末元素。
 func (l *Ledger) resolveProxy(chains []string) string {
 	if len(chains) == 0 {
 		return ProxyUnknown
 	}
-	last := strings.TrimSpace(chains[len(chains)-1])
-	if last == "" {
+	first := strings.TrimSpace(chains[0])
+	if first == "" {
 		return ProxyUnknown
 	}
-	switch strings.ToUpper(last) {
+	switch strings.ToUpper(first) {
 	case "DIRECT":
 		return ProxyDirect
 	case "REJECT":
 		return ProxyReject
 	}
-	return last
+	return first
 }
 
 // admitSite 维护站点集合并执行配额：超出上限的新站点归入 other 桶（other 不占配额）。

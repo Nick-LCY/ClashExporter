@@ -15,6 +15,13 @@ import (
 	"github.com/sankabox/clash-exporter/internal/snapshot"
 )
 
+// 实测样本中的代理链：chains 顺序为 [实际出口节点, 策略组]，
+// 出口节点是首元素，策略组名是末元素。
+const (
+	exitNode = "🇭🇰 E-香港2"
+	proxyGrp = "KyCloud"
+)
+
 // mockMihomo 是可编程的 mihomo /connections 模拟端点。
 type mockMihomo struct {
 	mu      sync.Mutex
@@ -96,7 +103,7 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 				Metadata: mihomo.ConnectionMetadata{Type: "Redir", SourceIP: "192.168.2.135", Host: "example.com"},
 				Upload:   100,
 				Download: 200,
-				Chains:   []string{"KyCloud"},
+				Chains:   []string{exitNode, proxyGrp},
 			},
 			{
 				ID:       "c2",
@@ -115,7 +122,7 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 	book.Observe(base, resp)
 
 	series := book.Export()
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionUpload); got != 100 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionUpload); got != 100 {
 		t.Errorf("首轮上行 = %d, 期望 100", got)
 	}
 	if got := mustSeriesValue(t, series, "旁路由本机", "stun.hitv.com", ledger.ProxyDirect, ledger.DirectionDownload); got != 25 {
@@ -138,7 +145,7 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 				Metadata: mihomo.ConnectionMetadata{Type: "Redir", SourceIP: "192.168.2.135", Host: "example.com"},
 				Upload:   150,
 				Download: 260,
-				Chains:   []string{"KyCloud"},
+				Chains:   []string{exitNode, proxyGrp},
 			},
 		},
 	})
@@ -150,10 +157,10 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 
 	series = book.Export()
 	// 导出值是累加型计数器：第二轮 = 首轮 100 + 本轮增量 50
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionUpload); got != 150 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionUpload); got != 150 {
 		t.Errorf("第二轮上行累计 = %d, 期望 150", got)
 	}
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionDownload); got != 260 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionDownload); got != 260 {
 		t.Errorf("第二轮下行累计 = %d, 期望 260", got)
 	}
 	if got := book.GlobalUpload(); got != 1500 {
@@ -197,7 +204,7 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 				Metadata: mihomo.ConnectionMetadata{Type: "Redir", SourceIP: "192.168.2.135", Host: "example.com"},
 				Upload:   250,
 				Download: 400,
-				Chains:   []string{"KyCloud"},
+				Chains:   []string{exitNode, proxyGrp},
 			},
 		},
 	})
@@ -208,10 +215,10 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 	restored.Observe(base.Add(10*time.Second), resp)
 
 	series = restored.Export()
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionUpload); got != 250 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionUpload); got != 250 {
 		t.Errorf("恢复后上行累计 = %d, 期望 250（150 + 增量 100，而非重新全量计入 400）", got)
 	}
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionDownload); got != 400 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionDownload); got != 400 {
 		t.Errorf("恢复后下行累计 = %d, 期望 400（260 + 增量 140）", got)
 	}
 
@@ -224,7 +231,7 @@ func TestEndToEndAgainstMockMihomo(t *testing.T) {
 	book.Observe(base.Add(10*time.Second), resp)
 
 	series = book.Export()
-	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", "KyCloud", ledger.DirectionUpload); got != 150 {
+	if got := mustSeriesValue(t, series, "192.168.2.135", "example.com", exitNode, ledger.DirectionUpload); got != 150 {
 		t.Errorf("连接消失后上行 = %d, 期望保持 150", got)
 	}
 	if got := book.ActiveConnections(); got != 0 {

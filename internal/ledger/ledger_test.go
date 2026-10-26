@@ -339,6 +339,7 @@ func TestProxyNormalization(t *testing.T) {
 		conn("c1", "192.168.2.10", "a.com", []string{"DIRECT"}, 100, 0),
 		conn("c2", "192.168.2.10", "b.com", []string{"REJECT"}, 50, 0),
 		conn("c3", "192.168.2.10", "c.com", nil, 25, 0),
+		// 实测顺序为 [实际出口节点, 策略组]：代理标签取首元素
 		conn("c4", "192.168.2.10", "d.com", []string{"🇭🇰 节点", "KyCloud"}, 10, 0),
 	))
 
@@ -352,8 +353,34 @@ func TestProxyNormalization(t *testing.T) {
 	if got := mustValue(t, series, "192.168.2.10", "c.com", ProxyUnknown, DirectionUpload); got != 25 {
 		t.Errorf("空链归一化上行 = %d, 期望 25", got)
 	}
-	if got := mustValue(t, series, "192.168.2.10", "d.com", "KyCloud", DirectionUpload); got != 10 {
-		t.Errorf("取链末端上行 = %d, 期望 10", got)
+	if got := mustValue(t, series, "192.168.2.10", "d.com", "🇭🇰 节点", DirectionUpload); got != 10 {
+		t.Errorf("取链首元素上行 = %d, 期望 10", got)
+	}
+	if _, ok := findSeries(series, "192.168.2.10", "d.com", "KyCloud", DirectionUpload); ok {
+		t.Error("代理标签不应取策略组名（chains 末元素）")
+	}
+}
+
+// TestProxyMultiLevelChainTakesFirstElement 覆盖多级链：chains 顺序为 [实际出口节点, 策略组...]，
+// 代理标签必须取首元素（实际出口），不得被策略组名覆盖。
+func TestProxyMultiLevelChainTakesFirstElement(t *testing.T) {
+	l := newTestLedger(t, Options{})
+
+	l.Observe(baseTime, resp(
+		conn("c1", "192.168.2.10", "a.com", []string{"节点A", "组B", "组C"}, 100, 200),
+	))
+
+	series := l.Export()
+	if got := mustValue(t, series, "192.168.2.10", "a.com", "节点A", DirectionUpload); got != 100 {
+		t.Errorf("多级链上行 = %d, 期望 100", got)
+	}
+	if got := mustValue(t, series, "192.168.2.10", "a.com", "节点A", DirectionDownload); got != 200 {
+		t.Errorf("多级链下行 = %d, 期望 200", got)
+	}
+	for _, group := range []string{"组B", "组C"} {
+		if _, ok := findSeries(series, "192.168.2.10", "a.com", group, DirectionUpload); ok {
+			t.Errorf("代理标签不应为策略组名 %q", group)
+		}
 	}
 }
 
