@@ -1,0 +1,44 @@
+# ClashExporter 配置示例
+#
+# 加载方式：clash-exporter -config /etc/clash-exporter/config.yml
+# 所有字段均为可选项，示例文件的取值与代码里的默认值逐项一致；
+# 未出现的字段使用默认值。未知字段会直接报错。
+
+# mihomo API 基础地址（不含 /connections 路径），scheme 必须是 http 或 https。
+api_url: "http://192.168.2.2:9090"
+
+# mihomo API 鉴权密钥（secret）。留空表示不发送 Authorization 头。
+api_secret: ""
+
+# 轮询间隔：拉取 /connections 的周期，可写 "5s"/"24h" 字符串或整数秒，取值范围 [1s, 60s]。
+poll_interval: 5s
+
+# 淘汰时间：某「设备 × 站点 × 节点」组合连续该时长没有新增字节即停止导出（账本数据保留，
+# 再次产生流量时自动重锚续报）。必须大于 0。
+evict_ttl: 24h
+
+# 快照写盘间隔：账本状态落盘的周期，必须大于 0。
+snapshot_interval: 30s
+
+# 站点标签去重上限：不同站点名的数量上限，超出的新站点统一归入 other 桶（other 本身不占配额）。
+# 必须大于 0。
+site_label_cap: 10000
+
+# 快照文件路径，父目录会自动创建。
+snapshot_path: "./data/state.json"
+
+# HTTP 监听地址，暴露 /metrics、/ 与 /healthz。
+listen_addr: ":9095"
+
+# 设备别名：源 IP -> 别名。命中别名则用别名作为 device 标签，否则用原始 IP。
+# 旁路由本机自身发起的流量源 IP 为 TUN 网关地址，可写成：
+# device_aliases:
+#   "198.18.0.1": "旁路由本机"
+device_aliases: {}
+
+# 站点归组规则：按顺序匹配，首条命中的规则生效，group 为归组名。
+# 写成：
+# site_group_rules:
+#   - pattern: "(?i)\\.google\\.com$"
+#     group: "google"
+site_group_rules: []

@@ -1,0 +1,5 @@
+/bin/
+/data/
+/clash-exporter
+*.test
+*.out
