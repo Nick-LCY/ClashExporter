@@ -1,0 +1,8 @@
+{
+  "name": "codegraph-pi-extension",
+  "private": true,
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "typebox": "^1.1.38"
+  }
+}

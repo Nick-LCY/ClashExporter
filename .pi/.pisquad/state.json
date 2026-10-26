@@ -1,0 +1,10 @@
+{
+  "version": "0.3.2",
+  "cliVersion": "0.3.2",
+  "channels": {
+    "core": true,
+    "codegraph": true,
+    "entire": false
+  },
+  "installedAt": "2026-10-26T03:48:55.909Z"
+}
