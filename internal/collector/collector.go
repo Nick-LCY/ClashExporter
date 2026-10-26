@@ -30,10 +30,10 @@ const (
 const (
 	helpTrafficBytes      = "按 设备 × 站点 × 出口节点 拆分的累计流量字节数，direction 取 upload 或 download。"
 	helpTrafficTotalBytes = "mihomo 内核上报的全局累计流量字节数，用于与分维度指标对账。"
-	helpActiveConnections = "mihomo 当前活跃连接数。"
+	helpActiveConnections = "最近一次成功拉取观察到的活跃连接数。"
 	helpUp                = "mihomo 内核可达性，1 表示可达，0 表示不可达。"
 	helpScrapeDuration    = "最近一轮采集 /connections 的耗时（秒）。"
-	helpStateEntries      = "账本当前的条目数（含已淘汰但数据仍保留的条目）。"
+	helpStateEntries      = "账本当前的条目数（含已淘汰但尚未到清理时限的条目）。"
 )
 
 // Collector 是账本的 Prometheus 采集器，实现 prometheus.Collector 接口。

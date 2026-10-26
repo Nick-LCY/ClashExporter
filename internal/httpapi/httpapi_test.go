@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// fakeUp 是可控的可达性状态源。
+type fakeUp struct {
+	up bool
+}
+
+func (f *fakeUp) Up() bool { return f.up }
+
 // newTestServer 创建一个带测试指标的 HTTP 服务。
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -23,7 +31,7 @@ func newTestServer(t *testing.T) *Server {
 		Help: "mihomo 内核可达性。",
 	}, func() float64 { return 1 }))
 
-	return New(reg, "127.0.0.1:0")
+	return New(reg, "127.0.0.1:0", &fakeUp{up: true})
 }
 
 // do 发起一次请求并返回响应。
@@ -71,10 +79,72 @@ func TestIndexPage(t *testing.T) {
 		t.Fatalf("读取响应体失败: %v", err)
 	}
 	text := string(body)
-	for _, want := range []string{"/metrics", "/healthz", "clash_traffic_bytes_total"} {
+	for _, want := range []string{"/metrics", "/healthz", "/readyz", "clash_traffic_bytes_total"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("说明页缺少内容 %q", want)
 		}
+	}
+}
+
+// TestReadyzReflectsUpStatus 校验 /readyz 按 mihomo 可达性返回 200/503。
+func TestReadyzReflectsUpStatus(t *testing.T) {
+	up := &fakeUp{up: true}
+	s := New(prometheus.NewRegistry(), "127.0.0.1:0", up)
+
+	resp := do(t, s, http.MethodGet, "/readyz")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("可达时状态码 = %d, 期望 %d", resp.StatusCode, http.StatusOK)
+	}
+
+	up.up = false
+	resp = do(t, s, http.MethodGet, "/readyz")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("不可达时状态码 = %d, 期望 %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+// TestReadyzWithoutStatusSource 校验未提供状态源时 /readyz 返回 503。
+func TestReadyzWithoutStatusSource(t *testing.T) {
+	s := New(prometheus.NewRegistry(), "127.0.0.1:0", nil)
+
+	resp := do(t, s, http.MethodGet, "/readyz")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("无状态源时状态码 = %d, 期望 %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+// TestServeFailureTriggersExit 校验服务异常退出（非主动关闭）时触发退出动作，不带病运行。
+func TestServeFailureTriggersExit(t *testing.T) {
+	s := newTestServer(t)
+
+	errCh := make(chan error, 1)
+	s.SetExitFunc(func(err error) { errCh <- err })
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("启动 HTTP 服务失败: %v", err)
+	}
+
+	// 直接关掉监听器，制造一个非主动关闭的 Serve 错误
+	s.mu.Lock()
+	ln := s.ln
+	s.mu.Unlock()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("关闭监听器失败: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("退出动作应当收到非空错误")
+		}
+		if errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("主动关闭不应触发退出动作, 错误 = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("服务异常退出时应当触发退出动作")
 	}
 }
 

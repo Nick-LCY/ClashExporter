@@ -2,6 +2,7 @@
 //
 // 写入采用「同目录临时文件 → fsync → rename → 父目录 fsync」的原子替换，
 // 保证任何时刻中断都不会读到半截 JSON；写失败时删除临时文件并保留旧快照。
+// 文件权限 0600、数据目录 0700：快照含内网流量明细，不对其他用户开放。
 package snapshot
 
 import (
@@ -28,18 +29,24 @@ func Save(path string, state *ledger.State) error {
 	}
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("创建快照目录 %s 失败: %w", dir, err)
 	}
 
 	tmp := filepath.Join(dir, filepath.Base(path)+tempSuffix)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("创建临时快照文件 %s 失败: %w", tmp, err)
 	}
+	// 临时文件已存在时 O_CREATE 不会改权限，显式收紧到 0600
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("设置临时快照文件 %s 权限失败: %w", tmp, err)
+	}
 
+	// 紧凑 JSON：快照体积随条目数线性增长，不做缩进以省空间
 	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
 	if err := enc.Encode(state); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
@@ -59,10 +66,18 @@ func Save(path string, state *ledger.State) error {
 		return fmt.Errorf("替换快照文件失败: %w", err)
 	}
 
-	// 父目录 fsync：保证 rename 本身落盘
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
+	// 父目录 fsync：保证 rename 本身落盘。两处错误都必须返回：
+	// 吞掉错误等于赌 rename 已经持久化，崩溃后可能回到旧快照。
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("打开快照目录 %s 失败: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
 		_ = d.Close()
+		return fmt.Errorf("快照目录 %s 刷盘失败: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("关闭快照目录 %s 失败: %w", dir, err)
 	}
 	return nil
 }

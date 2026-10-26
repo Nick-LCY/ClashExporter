@@ -22,6 +22,9 @@ func TestDefaultConfig(t *testing.T) {
 	if got := cfg.EvictTTL.Duration(); got != 24*time.Hour {
 		t.Errorf("evict_ttl 默认值 = %s, 期望 24h", got)
 	}
+	if got := cfg.PruneTTL.Duration(); got != 168*time.Hour {
+		t.Errorf("prune_ttl 默认值 = %s, 期望 168h", got)
+	}
 	if got := cfg.SnapshotInterval.Duration(); got != 30*time.Second {
 		t.Errorf("snapshot_interval 默认值 = %s, 期望 30s", got)
 	}
@@ -126,6 +129,9 @@ func TestLoadYAMLDefaultsFillMissingFields(t *testing.T) {
 	if cfg.EvictTTL != def.EvictTTL {
 		t.Errorf("缺省 evict_ttl = %s, 期望 %s", cfg.EvictTTL.Duration(), def.EvictTTL.Duration())
 	}
+	if cfg.PruneTTL != def.PruneTTL {
+		t.Errorf("缺省 prune_ttl = %s, 期望 %s", cfg.PruneTTL.Duration(), def.PruneTTL.Duration())
+	}
 	if cfg.SnapshotInterval != def.SnapshotInterval {
 		t.Errorf("缺省 snapshot_interval = %s, 期望 %s", cfg.SnapshotInterval.Duration(), def.SnapshotInterval.Duration())
 	}
@@ -188,6 +194,8 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"poll_interval 过大", func(c *Config) { c.PollInterval = Duration(90 * time.Second) }},
 		{"evict_ttl 为零", func(c *Config) { c.EvictTTL = 0 }},
 		{"evict_ttl 为负", func(c *Config) { c.EvictTTL = Duration(-time.Hour) }},
+		{"prune_ttl 为零", func(c *Config) { c.PruneTTL = 0 }},
+		{"prune_ttl 为负", func(c *Config) { c.PruneTTL = Duration(-time.Hour) }},
 		{"snapshot_interval 为零", func(c *Config) { c.SnapshotInterval = 0 }},
 		{"site_label_cap 为零", func(c *Config) { c.SiteLabelCap = 0 }},
 		{"site_label_cap 为负", func(c *Config) { c.SiteLabelCap = -1 }},
@@ -235,6 +243,9 @@ func TestExampleFileMatchesDefaults(t *testing.T) {
 	if cfg.EvictTTL != def.EvictTTL {
 		t.Errorf("示例 evict_ttl = %s, 期望 %s", cfg.EvictTTL.Duration(), def.EvictTTL.Duration())
 	}
+	if cfg.PruneTTL != def.PruneTTL {
+		t.Errorf("示例 prune_ttl = %s, 期望 %s", cfg.PruneTTL.Duration(), def.PruneTTL.Duration())
+	}
 	if cfg.SnapshotInterval != def.SnapshotInterval {
 		t.Errorf("示例 snapshot_interval = %s, 期望 %s", cfg.SnapshotInterval.Duration(), def.SnapshotInterval.Duration())
 	}
@@ -252,5 +263,45 @@ func TestExampleFileMatchesDefaults(t *testing.T) {
 	}
 	if len(cfg.SiteGroupRules) != len(def.SiteGroupRules) {
 		t.Errorf("示例 site_group_rules 条数 = %d, 期望 %d", len(cfg.SiteGroupRules), len(def.SiteGroupRules))
+	}
+}
+
+// TestLoadEmptyDurationFallsBackToDefault 校验时长字段写成空值时回落到该字段默认值。
+func TestLoadEmptyDurationFallsBackToDefault(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"空字符串", "api_url: \"http://10.0.0.1:9090\"\npoll_interval: \"\"\n"},
+		{"纯空白字符串", "api_url: \"http://10.0.0.1:9090\"\npoll_interval: \"  \"\n"},
+		{"空值", "api_url: \"http://10.0.0.1:9090\"\npoll_interval:\n"},
+		{"evict_ttl 为空", "api_url: \"http://10.0.0.1:9090\"\nevict_ttl:\n"},
+		{"prune_ttl 为空字符串", "api_url: \"http://10.0.0.1:9090\"\nprune_ttl: \"  \"\n"},
+	}
+
+	def := Default()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatalf("写入临时配置失败: %v", err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("加载配置失败: %v", err)
+			}
+			if cfg.PollInterval != def.PollInterval {
+				t.Errorf("poll_interval = %s, 期望回落到默认值 %s",
+					cfg.PollInterval.Duration(), def.PollInterval.Duration())
+			}
+			if cfg.EvictTTL != def.EvictTTL {
+				t.Errorf("evict_ttl = %s, 期望回落到默认值 %s",
+					cfg.EvictTTL.Duration(), def.EvictTTL.Duration())
+			}
+			if cfg.PruneTTL != def.PruneTTL {
+				t.Errorf("prune_ttl = %s, 期望回落到默认值 %s",
+					cfg.PruneTTL.Duration(), def.PruneTTL.Duration())
+			}
+		})
 	}
 }

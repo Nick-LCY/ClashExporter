@@ -24,10 +24,11 @@ mihomo API  ──GET /connections──▶  轮询协程  ──▶  账本（�
 
 ### 工作原理要点
 
-- **增量归账**：默认每 5 秒拉一次 `/connections`。每条连接记录上次读数，按差值累加进账本；首次出现的连接把历史累计值一次性计入；计数器回退（内核重启）时增量记 0 并重置基线，绝不出现负值；连接消失时把残余差值补进账本后再从活跃表删除。
-- **标签归一化**：`device` 取连接的源 IP（可配别名），`site` 取嗅探到的域名（空或 IP 字面量归 `unresolved`，绝不拿目标 IP 冒充站点），`proxy` 取代理链首元素即真实出口节点（`DIRECT` / `REJECT` 归一化为 `direct` / `reject`）。
-- **计数器只增不减**：导出值取自账本里的「已导出值」这一单调量。跨进程重启由快照保证不归零；某组合长时间无流量被淘汰后再次出现时，重锚续报，Prometheus 端 `increase()` 跨空洞零丢失。
-- **失败只降级不误判**：拉取失败仅把 `clash_up` 置 0，**绝不执行消失检测**。网络抖动若把活连接误判为消失，会重复计入其累计值造成流量虚高。
+- **增量归账**：默认每 5 秒拉一次 `/connections`。每条连接记录上次读数，按差值累加进账本；首次出现的连接把历史累计值一次性计入；计数器回退（内核重启）时增量记 0 并重置基线，绝不出现负值；连接消失时只从活跃表移除，不做任何补账。
+- **已知损失边界**：连接在**最后一次轮询到连接关闭之间**产生的流量不可观测（内核不保留已关闭连接的历史累计值），属已知损失，**上限约为一个轮询间隔**（默认 5s）。除此之外的流量都不丢。
+- **标签归一化**：`device` 取连接的源 IP（可配别名），`site` 取嗅探到的域名（空或 IP 字面量归 `unresolved`，绝不拿目标 IP 冒充站点），`proxy` 取代理链首元素即真实出口节点（`DIRECT` / `REJECT` 归一化为 `direct` / `reject`）。零流量连接不占用站点配额。
+- **计数器只增不减**：导出值取自账本里的「已导出值」这一单调量。跨进程重启由快照保证不归零；某组合长时间无流量被淘汰后再次出现时，重锚续报，Prometheus 端 `increase()` 跨空洞零丢失。重锚后的第一帧可被任意一次 `/metrics` 抓取消费（含人工 `curl`），导出值仍单调无损，但精确的帧边界与抓取节奏耦合。
+- **失败只降级不误判**：拉取失败仅把 `clash_up` 置 0，**绝不执行消失检测**。网络抖动若把活连接误判为消失，会重复计入其累计值造成流量虚高。退出流程导致的取消不算拉取失败：不会把 `clash_up` 置 0。
 - **不做什么**：不落时序数据库、不做本地历史存储、不做可视化看板、不改造 mihomo 鉴权、不做流量控制。一个 exporter 实例只对应一台 mihomo。
 
 ### 快速开始
@@ -44,10 +45,10 @@ curl -s localhost:9095/metrics | grep '^clash_'
 |---|---|---|---|
 | `clash_traffic_bytes_total` | counter | `device`、`site`、`proxy`、`direction` | 核心指标：设备 × 站点 × 出口节点 的累计流量字节数，`direction` 取 `upload` / `download` |
 | `clash_traffic_total_bytes_total` | counter | `direction` | 全局对账指标：mihomo 上报的总流量字节数，取历史最大值防止内核重启导致回退 |
-| `clash_active_connections` | gauge | — | 最近一轮观察到的活跃连接数 |
+| `clash_active_connections` | gauge | — | 最近一次成功拉取观察到的活跃连接数 |
 | `clash_up` | gauge | — | mihomo 内核可达性，`1` 可达、`0` 不可达 |
 | `clash_scrape_duration_seconds` | gauge | — | 最近一轮采集 `/connections` 的耗时（秒） |
-| `clash_exporter_state_entries` | gauge | — | 账本当前的条目数（含已淘汰但数据仍保留的条目） |
+| `clash_exporter_state_entries` | gauge | — | 账本当前的条目数（含已淘汰但尚未到 `prune_ttl` 清理时限的条目） |
 
 核心指标是**单张全维度表**，exporter 不预聚合、不产出交叉表；所有维度切片统计交给 Prometheus 查询时聚合：
 
@@ -81,10 +82,11 @@ curl -s localhost:9095/metrics | grep '^clash_'
 | `api_secret` | string | 空 | mihomo 鉴权密钥；非空时带 `Authorization: Bearer` 头，为空时不带鉴权头 |
 | `poll_interval` | duration | `5s` | 轮询间隔，取值范围 `[1s, 60s]`；支持 `"5s"` / `"24h"` 字符串与整数秒 |
 | `evict_ttl` | duration | `24h` | 淘汰时间：某组合连续该时长没有新增字节即停止导出（数据保留，再次来流量时自动重锚续报） |
+| `prune_ttl` | duration | `168h` | 账本清理时限：条目被淘汰且静默超过该时长后从账本删除、快照不再包含（已无待导出增量，不丢已观测字节；该组合日后重现以新基线重新计数） |
 | `snapshot_interval` | duration | `30s` | 快照写盘间隔 |
 | `site_label_cap` | int | `10000` | 站点标签去重上限，超出的新站点归入 `other` 桶（`other` 本身不占配额） |
 | `snapshot_path` | string | `./data/state.json` | 快照文件路径，父目录自动创建 |
-| `listen_addr` | string | `:9095` | HTTP 监听地址，暴露 `/metrics`、`/`、`/healthz` |
+| `listen_addr` | string | `:9095` | HTTP 监听地址，暴露 `/metrics`、`/`、`/healthz`、`/readyz`；如需只对内网可见，把 `listen_addr` 改为具体内网 IP（如 `192.168.2.10:9095`） |
 | `device_aliases` | map | `{}` | 源 IP → 设备别名，例如 `"198.18.0.1": "旁路由本机"` |
 | `site_group_rules` | list | `[]` | 站点归组规则，按顺序匹配，首条命中的规则生效 |
 
@@ -95,6 +97,7 @@ api_url: "http://192.168.2.2:9090"
 api_secret: ""
 poll_interval: 5s
 evict_ttl: 24h
+prune_ttl: 168h
 snapshot_interval: 30s
 site_label_cap: 10000
 snapshot_path: "./data/state.json"
@@ -117,6 +120,7 @@ site_group_rules:
 | `GET /metrics` | Prometheus 抓取端点 |
 | `GET /` | 纯文本说明页 |
 | `GET /healthz` | 健康检查，返回 `ok` |
+| `GET /readyz` | 就绪检查：mihomo 可达（`clash_up=1`）返回 `200`，不可达返回 `503` |
 
 ## 四、systemd 部署示例
 
@@ -161,6 +165,9 @@ Group=clash-exporter
 ExecStart=/usr/local/bin/clash-exporter -config /etc/clash-exporter/config.yml
 Restart=always
 RestartSec=5s
+
+# 快照含内网流量明细：新建文件与目录默认 0600 / 0700
+UMask=0077
 
 # 快照目录可写，其余只读
 StateDirectory=clash-exporter

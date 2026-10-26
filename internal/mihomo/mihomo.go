@@ -16,11 +16,15 @@ import (
 
 const (
 	// maxResponseBytes 限制单次响应体的读取上限（64MB），避免异常响应撑爆内存。
-	maxResponseBytes = 64 << 20
+	maxResponseBytes int64 = 64 << 20
 
 	// minTimeout 是客户端超时的下限，防止轮询间隔很短时请求被过早掐断。
 	minTimeout = 10 * time.Second
 )
+
+// responseLimit 是实际生效的读取上限，正常等于 maxResponseBytes；
+// 单元测试会临时调小它，避免搬运 64MB 数据。
+var responseLimit = maxResponseBytes
 
 // ConnectionMetadata 是单条连接的元信息。
 type ConnectionMetadata struct {
@@ -99,9 +103,14 @@ func (c *Client) FetchConnections(ctx context.Context) (*ConnectionsResponse, er
 		return nil, fmt.Errorf("mihomo API 返回非 2xx 状态码: %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// 多读 1 字节：读到的长度超过上限就能判定超限，而不是把截断后的半个 JSON
+	// 当成解析错误报出去。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, responseLimit+1))
 	if err != nil {
 		return nil, fmt.Errorf("读取 mihomo 响应体失败: %w", err)
+	}
+	if int64(len(body)) > responseLimit {
+		return nil, fmt.Errorf("响应体超过 %s 上限", humanSize(responseLimit))
 	}
 
 	var out ConnectionsResponse
@@ -109,4 +118,18 @@ func (c *Client) FetchConnections(ctx context.Context) (*ConnectionsResponse, er
 		return nil, fmt.Errorf("解析 mihomo 响应 JSON 失败: %w", err)
 	}
 	return &out, nil
+}
+
+// humanSize 把字节数格式化成便于阅读的容量字符串（64MB / 1KB / 512B）。
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.0f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

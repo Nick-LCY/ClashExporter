@@ -3,6 +3,7 @@ package snapshot
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,5 +212,48 @@ func TestSaveKeepsOldSnapshotOnFailure(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Error("写入失败后旧快照被破坏")
+	}
+}
+
+// TestSaveUsesRestrictivePermissions 校验快照文件为 0600、数据目录为 0700。
+func TestSaveUsesRestrictivePermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested")
+	path := filepath.Join(dir, "state.json")
+
+	if err := Save(path, sampleState()); err != nil {
+		t.Fatalf("保存快照失败: %v", err)
+	}
+
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("读取快照文件信息失败: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("快照文件权限 = %o, 期望 600", got)
+	}
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("读取数据目录信息失败: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Errorf("数据目录权限 = %o, 期望 700", got)
+	}
+}
+
+// TestSaveWritesCompactJSON 校验快照是紧凑 JSON（单行），不做缩进。
+func TestSaveWritesCompactJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+
+	if err := Save(path, sampleState()); err != nil {
+		t.Fatalf("保存快照失败: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取快照失败: %v", err)
+	}
+	if got := strings.Count(strings.TrimRight(string(data), "\n"), "\n"); got != 0 {
+		t.Errorf("快照应为单行紧凑 JSON, 实际行数 = %d", got+1)
 	}
 }

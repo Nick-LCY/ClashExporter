@@ -19,6 +19,9 @@ func newTestLedger(t *testing.T, opts Options) *Ledger {
 	if opts.EvictTTL == 0 {
 		opts.EvictTTL = 24 * time.Hour
 	}
+	if opts.PruneTTL == 0 {
+		opts.PruneTTL = 168 * time.Hour
+	}
 	l, err := New(opts)
 	if err != nil {
 		t.Fatalf("创建账本失败: %v", err)
@@ -123,30 +126,64 @@ func TestObserveCounterResetDoesNotGoNegative(t *testing.T) {
 	}
 }
 
-func TestDisappearedConnectionResidualFlushed(t *testing.T) {
+// TestDisappearedConnectionRemovedWithoutResidual 校验连接消失后的真实可观测行为：
+// ① 活跃连接表归零；② 账本条目数与累计值不变；③ 不出现任何负值或异常值；
+// ④ 同 ID 连接稍后重现时沿用消失前的基线，只计新增量，不重复计入已计过的部分。
+func TestDisappearedConnectionRemovedWithoutResidual(t *testing.T) {
 	l := newTestLedger(t, Options{})
 
 	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
-	mustValue(t, l.Export(), "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	first := l.Export()
+	uploadBefore := mustValue(t, first, "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	downloadBefore := mustValue(t, first, "192.168.2.10", "example.com", "node-a", DirectionDownload)
+	entriesBefore := l.EntryCount()
 
-	// 模拟「连接计数继续增长但尚未入账」的状态：观测值前进，已入账量落后
-	l.mu.Lock()
-	l.conns["c1"].Upload = 180
-	l.conns["c1"].Download = 260
-	l.mu.Unlock()
-
-	// 连接消失：残余必须被补账
+	// 连接消失：只从活跃表移除，账本不做任何补账
 	l.Observe(baseTime.Add(5*time.Second), resp())
 
+	if got := l.ActiveConnections(); got != 0 {
+		t.Errorf("连接消失后活跃连接数 = %d, 期望 0", got)
+	}
+	if got := len(l.Connections()); got != 0 {
+		t.Errorf("连接消失后活跃连接表长度 = %d, 期望 0", got)
+	}
+	if got := l.EntryCount(); got != entriesBefore {
+		t.Errorf("连接消失后条目数 = %d, 期望 %d（不应增删）", got, entriesBefore)
+	}
+
 	series := l.Export()
-	if got := mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionUpload); got != 180 {
-		t.Errorf("补账后上行 = %d, 期望 180", got)
+	uploadAfter := mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	downloadAfter := mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionDownload)
+	if uploadAfter != uploadBefore {
+		t.Errorf("连接消失后上行 = %d, 期望保持 %d", uploadAfter, uploadBefore)
 	}
-	if got := mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionDownload); got != 260 {
-		t.Errorf("补账后下行 = %d, 期望 260", got)
+	if downloadAfter != downloadBefore {
+		t.Errorf("连接消失后下行 = %d, 期望保持 %d", downloadAfter, downloadBefore)
 	}
-	if len(l.conns) != 0 {
-		t.Errorf("消失的连接应当从活跃表删除, 剩余 %d 条", len(l.conns))
+	// 导出值不得下降（不得出现负值或回绕）
+	for _, s := range series {
+		if s.Value > uploadBefore+downloadBefore {
+			t.Errorf("序列 %s/%s/%s/%s 的值 %d 超过消失前的累计值，疑似重复计入",
+				s.Device, s.Site, s.Proxy, s.Direction, s.Value)
+		}
+	}
+
+	// 同 ID 连接稍后重现：沿用消失前的基线（100/200），只计新增的 80/60
+	l.Observe(baseTime.Add(10*time.Second), resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 180, 260)))
+
+	if got := l.ActiveConnections(); got != 1 {
+		t.Errorf("重现后活跃连接数 = %d, 期望 1", got)
+	}
+	series = l.Export()
+	uploadAfter = mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	downloadAfter = mustValue(t, series, "192.168.2.10", "example.com", "node-a", DirectionDownload)
+	if uploadAfter != uploadBefore+80 {
+		t.Errorf("同 ID 重现后上行 = %d, 期望 %d（基线 100 + 新增 80，不得全量重复计入 180）",
+			uploadAfter, uploadBefore+80)
+	}
+	if downloadAfter != downloadBefore+60 {
+		t.Errorf("同 ID 重现后下行 = %d, 期望 %d（基线 200 + 新增 60，不得全量重复计入 260）",
+			downloadAfter, downloadBefore+60)
 	}
 }
 
@@ -439,5 +476,198 @@ func TestUpAndAccessors(t *testing.T) {
 	l.SetScrapeDuration(120 * time.Millisecond)
 	if got := l.LastScrapeDuration(); got != 120*time.Millisecond {
 		t.Errorf("采集耗时 = %s, 期望 120ms", got)
+	}
+}
+
+// TestPruneRemovesExpiredEvictedEntry 校验过期淘汰条目会被从账本删除（快照随之不再包含）。
+func TestPruneRemovesExpiredEvictedEntry(t *testing.T) {
+	l := newTestLedger(t, Options{EvictTTL: 24 * time.Hour, PruneTTL: 168 * time.Hour})
+
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+	l.Export() // 清空待导出增量
+
+	// 静默 25h：条目被淘汰，但未到 prune_ttl，不得删除
+	l.Observe(baseTime.Add(25*time.Hour), resp())
+	if got := l.EntryCount(); got != 1 {
+		t.Errorf("未到 prune_ttl 的淘汰条目不应删除, EntryCount = %d, 期望 1", got)
+	}
+
+	// 静默超过 prune_ttl（168h）：条目从账本删除
+	l.Observe(baseTime.Add(169*time.Hour), resp())
+	if got := l.EntryCount(); got != 0 {
+		t.Errorf("过期淘汰条目应当被清理, EntryCount = %d, 期望 0", got)
+	}
+	if series := l.Export(); len(series) != 0 {
+		t.Errorf("被清理的条目不应导出, 实际导出 %d 条", len(series))
+	}
+	// 快照随之不再包含该条目
+	if got := len(l.Snapshot().Entries); got != 0 {
+		t.Errorf("快照中的条目数 = %d, 期望 0", got)
+	}
+}
+
+// TestPruneKeepsEntryWithPendingIncrement 校验带待导出增量的条目不被清理。
+func TestPruneKeepsEntryWithPendingIncrement(t *testing.T) {
+	l := newTestLedger(t, Options{EvictTTL: 24 * time.Hour, PruneTTL: 168 * time.Hour})
+
+	// 观察后不导出：待导出增量保持非零
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+
+	l.Observe(baseTime.Add(169*time.Hour), resp())
+	if got := l.EntryCount(); got != 1 {
+		t.Errorf("带待导出增量的条目不应被清理, EntryCount = %d, 期望 1", got)
+	}
+}
+
+// TestPruneKeepsRecentEntry 校验未到淘汰时限的活跃条目不被清理。
+func TestPruneKeepsRecentEntry(t *testing.T) {
+	l := newTestLedger(t, Options{EvictTTL: 24 * time.Hour, PruneTTL: 168 * time.Hour})
+
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+	l.Export()
+
+	// 刚产生过流量：既未淘汰也未到 prune_ttl
+	l.Observe(baseTime.Add(1*time.Hour), resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 150, 260)))
+	if got := l.EntryCount(); got != 1 {
+		t.Errorf("活跃条目不应被清理, EntryCount = %d, 期望 1", got)
+	}
+}
+
+// TestRestoreRestoresActiveConnections 校验恢复快照后活跃连接表被完整恢复。
+func TestRestoreRestoresActiveConnections(t *testing.T) {
+	l := newTestLedger(t, Options{})
+	l.Observe(baseTime, resp(
+		conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200),
+		conn("c2", "192.168.2.11", "other.com", []string{"node-b"}, 50, 60),
+	))
+
+	state := l.Snapshot()
+
+	restored := newTestLedger(t, Options{})
+	restored.Restore(state)
+
+	conns := restored.Connections()
+	if len(conns) != 2 {
+		t.Fatalf("恢复后活跃连接表长度 = %d, 期望 2", len(conns))
+	}
+	if conns[0].ID != "c1" || conns[1].ID != "c2" {
+		t.Errorf("恢复后的连接 ID = %q/%q, 期望 c1/c2", conns[0].ID, conns[1].ID)
+	}
+	if conns[0].Upload != 100 || conns[0].Download != 200 {
+		t.Errorf("恢复后 c1 的累计值 = %d/%d, 期望 100/200", conns[0].Upload, conns[0].Download)
+	}
+	if conns[1].Device != "192.168.2.11" || conns[1].Site != "other.com" || conns[1].Proxy != "node-b" {
+		t.Errorf("恢复后 c2 的维度 = %+v, 期望 device=192.168.2.11 site=other.com proxy=node-b", conns[1])
+	}
+	if got := restored.ActiveConnections(); got != 2 {
+		t.Errorf("恢复后活跃连接数 = %d, 期望 2", got)
+	}
+}
+
+// TestCounterResetToZeroResetsBaseline 校验计数器回退到 0 时基线被重置。
+func TestCounterResetToZeroResetsBaseline(t *testing.T) {
+	l := newTestLedger(t, Options{})
+
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+	first := mustValue(t, l.Export(), "192.168.2.10", "example.com", "node-a", DirectionUpload)
+
+	// 计数器回退到 0（内核重启）：增量记 0，导出值不得下降
+	l.Observe(baseTime.Add(5*time.Second), resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 0, 0)))
+	second := mustValue(t, l.Export(), "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	if second != first {
+		t.Errorf("计数器回退到 0 后导出值 = %d, 期望保持 %d", second, first)
+	}
+
+	// 基线已重置为 0：之后的增量按新基线计算
+	l.Observe(baseTime.Add(10*time.Second), resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 30, 40)))
+	third := mustValue(t, l.Export(), "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	if third != first+30 {
+		t.Errorf("基线重置后的导出值 = %d, 期望 %d", third, first+30)
+	}
+}
+
+// TestEmptySourceIPFallsBackToUnknownDevice 校验源 IP 为空时 device 标签为 unknown。
+func TestEmptySourceIPFallsBackToUnknownDevice(t *testing.T) {
+	l := newTestLedger(t, Options{})
+
+	l.Observe(baseTime, resp(conn("c1", "", "example.com", []string{"node-a"}, 100, 200)))
+
+	series := l.Export()
+	if got := mustValue(t, series, DeviceUnknown, "example.com", "node-a", DirectionUpload); got != 100 {
+		t.Errorf("源 IP 为空时上行 = %d, 期望 100", got)
+	}
+	if _, ok := findSeries(series, "", "example.com", "node-a", DirectionUpload); ok {
+		t.Error("源 IP 为空时不应以空串作为 device 标签")
+	}
+}
+
+// TestObserveNilResponseIsSafe 校验 Observe 收到空响应时安全提前返回。
+func TestObserveNilResponseIsSafe(t *testing.T) {
+	l := newTestLedger(t, Options{})
+
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+	before := l.Export()
+	uploadBefore := mustValue(t, before, "192.168.2.10", "example.com", "node-a", DirectionUpload)
+	entriesBefore := l.EntryCount()
+	activeBefore := l.ActiveConnections()
+
+	// 空响应：不得 panic，不得改动账本
+	l.Observe(baseTime.Add(5*time.Second), nil)
+
+	if got := l.EntryCount(); got != entriesBefore {
+		t.Errorf("空响应后条目数 = %d, 期望 %d", got, entriesBefore)
+	}
+	if got := l.ActiveConnections(); got != activeBefore {
+		t.Errorf("空响应后活跃连接数 = %d, 期望 %d", got, activeBefore)
+	}
+	after := l.Export()
+	if got := mustValue(t, after, "192.168.2.10", "example.com", "node-a", DirectionUpload); got != uploadBefore {
+		t.Errorf("空响应后导出值 = %d, 期望 %d", got, uploadBefore)
+	}
+}
+
+// TestObserveClampsClockRollback 校验时钟回拨时按上次时间处理。
+func TestObserveClampsClockRollback(t *testing.T) {
+	l := newTestLedger(t, Options{})
+
+	l.Observe(baseTime, resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 100, 200)))
+	l.Export()
+
+	// 时钟回拨：注入的时间早于上一次
+	l.Observe(baseTime.Add(-time.Hour), resp(conn("c1", "192.168.2.10", "example.com", []string{"node-a"}, 150, 260)))
+
+	state := l.Snapshot()
+	if !state.UpdatedAt.Equal(baseTime) {
+		t.Errorf("时钟回拨后的账本时间 = %s, 期望 %s（不得倒退）", state.UpdatedAt, baseTime)
+	}
+	if len(state.Entries) != 1 {
+		t.Fatalf("条目数 = %d, 期望 1", len(state.Entries))
+	}
+	if !state.Entries[0].LastActivity.Equal(baseTime) {
+		t.Errorf("条目最后活动时间 = %s, 期望 %s（不得随时钟回拨倒退）",
+			state.Entries[0].LastActivity, baseTime)
+	}
+	// 增量仍被正常计入
+	if got := mustValue(t, l.Export(), "192.168.2.10", "example.com", "node-a", DirectionUpload); got != 150 {
+		t.Errorf("时钟回拨后的导出值 = %d, 期望 150", got)
+	}
+}
+
+// TestZeroTrafficConnectionDoesNotConsumeSiteQuota 校验零流量连接不占用站点配额。
+func TestZeroTrafficConnectionDoesNotConsumeSiteQuota(t *testing.T) {
+	l := newTestLedger(t, Options{SiteCap: 1})
+
+	// 零流量连接：站点不进入站点集合，不占配额
+	l.Observe(baseTime, resp(conn("c0", "192.168.2.10", "idle.com", []string{"node-a"}, 0, 0)))
+
+	// 之后有流量的新站点仍能拿到自己的名字（未被挤进 other 桶）
+	l.Observe(baseTime.Add(time.Second), resp(conn("c1", "192.168.2.10", "real.com", []string{"node-a"}, 20, 0)))
+
+	series := l.Export()
+	if got := mustValue(t, series, "192.168.2.10", "real.com", "node-a", DirectionUpload); got != 20 {
+		t.Errorf("有流量的站点上行 = %d, 期望 20（站点名不应被零流量连接挤掉）", got)
+	}
+	if _, ok := findSeries(series, "192.168.2.10", SiteOther, "node-a", DirectionUpload); ok {
+		t.Error("不应出现 other 桶：零流量连接不应占用站点配额")
 	}
 }

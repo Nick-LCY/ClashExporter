@@ -23,6 +23,10 @@ type Duration time.Duration
 
 // UnmarshalYAML 解析 YAML 标量：字符串按 time.ParseDuration 解析，
 // 整数按秒解释，浮点数按秒解释。
+//
+// 空值（空字符串或纯空白）不修改当前值：配置加载时字段已预填默认值，
+// 因此空值等价于「回落到该字段默认值」，而不是变成 0。
+// YAML 的 null 值（写成 `poll_interval:`）由 yaml 库直接跳过本方法，效果相同。
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	var raw any
 	if err := node.Decode(&raw); err != nil {
@@ -30,7 +34,6 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	}
 	switch v := raw.(type) {
 	case nil:
-		*d = 0
 		return nil
 	case int:
 		*d = Duration(time.Duration(v) * time.Second)
@@ -47,7 +50,6 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	case string:
 		s := strings.TrimSpace(v)
 		if s == "" {
-			*d = 0
 			return nil
 		}
 		if parsed, err := time.ParseDuration(s); err == nil {
@@ -86,6 +88,7 @@ type Config struct {
 	APISecret        string            `yaml:"api_secret"`
 	PollInterval     Duration          `yaml:"poll_interval"`
 	EvictTTL         Duration          `yaml:"evict_ttl"`
+	PruneTTL         Duration          `yaml:"prune_ttl"`
 	SnapshotInterval Duration          `yaml:"snapshot_interval"`
 	SiteLabelCap     int               `yaml:"site_label_cap"`
 	SnapshotPath     string            `yaml:"snapshot_path"`
@@ -101,6 +104,7 @@ func Default() *Config {
 		APISecret:        "",
 		PollInterval:     Duration(5 * time.Second),
 		EvictTTL:         Duration(24 * time.Hour),
+		PruneTTL:         Duration(168 * time.Hour),
 		SnapshotInterval: Duration(30 * time.Second),
 		SiteLabelCap:     10000,
 		SnapshotPath:     "./data/state.json",
@@ -153,6 +157,9 @@ func (c *Config) Validate() error {
 	}
 	if c.EvictTTL.Duration() <= 0 {
 		return fmt.Errorf("evict_ttl 必须大于 0，当前为 %s", c.EvictTTL.Duration())
+	}
+	if c.PruneTTL.Duration() <= 0 {
+		return fmt.Errorf("prune_ttl 必须大于 0，当前为 %s", c.PruneTTL.Duration())
 	}
 	if c.SnapshotInterval.Duration() <= 0 {
 		return fmt.Errorf("snapshot_interval 必须大于 0，当前为 %s", c.SnapshotInterval.Duration())

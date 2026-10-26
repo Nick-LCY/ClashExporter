@@ -3,6 +3,9 @@
 // 并负责标签归一化、淘汰与重锚、全局对账值。
 //
 // 账本是所有导出指标的唯一数据源，状态可完整快照与恢复。
+//
+// 已知损失边界：连接在最后一次轮询之后、关闭之前产生的流量不可观测，
+// 属已知损失，上限约为一个轮询间隔。
 package ledger
 
 import (
@@ -46,6 +49,9 @@ const (
 	// defaultSiteCap 与 defaultEvictTTL 是未显式配置时的回落值。
 	defaultSiteCap  = 10000
 	defaultEvictTTL = 24 * time.Hour
+
+	// defaultPruneTTL 是账本过期条目清理时限的回落值（7 天）。
+	defaultPruneTTL = 168 * time.Hour
 )
 
 // Key 是一个账本条目的三个维度。
@@ -119,10 +125,19 @@ type GroupRule struct {
 
 // Options 是账本的构造参数。
 type Options struct {
-	SiteCap       int
-	EvictTTL      time.Duration
+	SiteCap  int
+	EvictTTL time.Duration
+	// PruneTTL 是过期条目清理时限：条目被淘汰且静默超过该时长后从账本删除。
+	PruneTTL      time.Duration
 	DeviceAliases map[string]string
 	GroupRules    []GroupRule
+}
+
+// goneConn 是已消失连接的基线记录。
+type goneConn struct {
+	state ConnState
+	// lastSeen 是该连接最后一次出现在活跃表中的轮次时间（近似值，误差不超过一个轮询间隔）。
+	lastSeen time.Time
 }
 
 // Ledger 是流量账本。所有方法都在同一把写锁下操作，锁内不做网络 IO。
@@ -133,6 +148,11 @@ type Ledger struct {
 	entries map[Key]*Entry
 	sites   map[string]struct{}
 	conns   map[string]*ConnState
+
+	// gone 保存已消失连接的基线（墓碑）：连接移出活跃表后仍保留它最后读到的累计值，
+	// 这样同 ID 连接稍后重现时可以沿用旧基线只计新增量，不会把已计过的部分重复计入。
+	// 墓碑不参与导出、不写入快照，超过 prune_ttl 后清理。
+	gone map[string]goneConn
 
 	globalUploadTotal   uint64
 	globalDownloadTotal uint64
@@ -152,6 +172,9 @@ func New(opts Options) (*Ledger, error) {
 	}
 	if opts.EvictTTL <= 0 {
 		opts.EvictTTL = defaultEvictTTL
+	}
+	if opts.PruneTTL <= 0 {
+		opts.PruneTTL = defaultPruneTTL
 	}
 
 	aliases := make(map[string]string, len(opts.DeviceAliases))
@@ -174,24 +197,33 @@ func New(opts Options) (*Ledger, error) {
 		opts: Options{
 			SiteCap:       opts.SiteCap,
 			EvictTTL:      opts.EvictTTL,
+			PruneTTL:      opts.PruneTTL,
 			DeviceAliases: aliases,
 			GroupRules:    rules,
 		},
 		entries: make(map[Key]*Entry),
 		sites:   make(map[string]struct{}),
 		conns:   make(map[string]*ConnState),
+		gone:    make(map[string]goneConn),
 	}, nil
 }
 
 // Observe 处理一轮拉取结果，顺序固定：
-// ① 活跃连接增量入账 → ② 消失连接残余补账 → ③ 淘汰扫描 → ④ 全局对账值更新。
+// ① 活跃连接增量入账 → ② 消失连接移出活跃表 → ③ 淘汰扫描与过期条目清理 → ④ 全局对账值更新。
 //
-// now 由调用方注入，便于测试与快照时间的一致性。
+// now 由调用方注入，便于测试与快照时间的一致性；出现时钟回拨时按上次时间处理。
 func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.lastNow = now
+	// 单调时钟保护：注入的时间若早于上一次（时钟回拨），沿用上一次的时间。
+	// 否则「now - LastActivity」可能为负，条目永远达不到淘汰条件。
+	if l.lastNow.IsZero() {
+		l.lastNow = now
+	} else if now.Before(l.lastNow) {
+		now = l.lastNow
+	}
+
 	if resp == nil {
 		return
 	}
@@ -202,22 +234,31 @@ func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse) {
 	for i := range resp.Connections {
 		conn := &resp.Connections[i]
 		device := l.resolveDevice(conn.Metadata.SourceIP)
-		site := l.admitSite(l.resolveSite(conn.Metadata.Host))
 		proxy := l.resolveProxy(conn.Chains)
-		key := Key{Device: device, Site: site, Proxy: proxy}
 
 		seen[conn.ID] = struct{}{}
 
 		st, ok := l.conns[conn.ID]
 		var deltaUpload, deltaDownload uint64
-		if !ok {
-			// 首次出现：历史累计值一次性全量计入
-			deltaUpload, deltaDownload = conn.Upload, conn.Download
-			st = &ConnState{ID: conn.ID, Device: device, Site: site, Proxy: proxy}
-			l.conns[conn.ID] = st
-		} else {
+		switch {
+		case ok:
+			// 已知连接：按增量计入
 			deltaUpload = saturatingSub(conn.Upload, st.Upload)
 			deltaDownload = saturatingSub(conn.Download, st.Download)
+		default:
+			if tomb, existed := l.gone[conn.ID]; existed {
+				// 该 ID 之前出现过但已离开活跃表：沿用消失前的基线，只计新增量，
+				// 不把之前已经计入账本的部分重复计入。
+				delete(l.gone, conn.ID)
+				st = &tomb.state
+				deltaUpload = saturatingSub(conn.Upload, st.Upload)
+				deltaDownload = saturatingSub(conn.Download, st.Download)
+			} else {
+				// 首次出现：历史累计值一次性全量计入
+				deltaUpload, deltaDownload = conn.Upload, conn.Download
+				st = &ConnState{ID: conn.ID, Device: device, Proxy: proxy}
+			}
+			l.conns[conn.ID] = st
 		}
 
 		// 计数器回退时增量为 0 并重置基线，同时把已入账量对齐到新基线
@@ -236,24 +277,34 @@ func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse) {
 
 		st.Upload = conn.Upload
 		st.Download = conn.Download
-		st.Device, st.Site, st.Proxy = device, site, proxy
+		st.Device, st.Proxy = device, proxy
 
-		if deltaUpload > 0 || deltaDownload > 0 {
-			l.creditLocked(key, deltaUpload, deltaDownload, now)
+		if deltaUpload == 0 && deltaDownload == 0 {
+			// 本轮没有实际增量：不入账，也不占用站点配额（零流量连接不占配额）
+			continue
 		}
+
+		// 只有本轮有实际增量的连接才占用站点配额
+		site := l.admitSite(l.resolveSite(conn.Metadata.Host))
+		st.Site = site
+		l.creditLocked(Key{Device: device, Site: site, Proxy: proxy}, deltaUpload, deltaDownload, now)
 	}
 
-	// ② 消失连接残余补账：把最后一次观测值与已入账量的差额补进账本
+	// ② 消失连接：移出活跃表，不做任何补账。
+	//
+	// 每轮 Observe 中 st.AccountedUpload 与 st.Upload 同步推进（两者恒等是可归纳证明的不变式），
+	// 因此「最后观测值 - 已入账值」的残余差值恒为 0，补账分支是不可达的死代码。
+	//
+	// 已知损失边界：连接在最后一次轮询之后、关闭之前产生的流量不可观测，
+	// 属已知损失，上限约为一个轮询间隔（poll_interval）。
+	//
+	// 这里只保留连接的基线（墓碑），供同 ID 连接稍后重现时算增量用。
 	for id, st := range l.conns {
 		if _, ok := seen[id]; ok {
 			continue
 		}
-		residualUpload := saturatingSub(st.Upload, st.AccountedUpload)
-		residualDownload := saturatingSub(st.Download, st.AccountedDownload)
-		if residualUpload > 0 || residualDownload > 0 {
-			l.creditLocked(Key{Device: st.Device, Site: st.Site, Proxy: st.Proxy}, residualUpload, residualDownload, now)
-		}
 		delete(l.conns, id)
+		l.gone[id] = goneConn{state: *st, lastSeen: now}
 	}
 
 	// ③ 淘汰扫描：超过 TTL 没有新增字节的条目停止导出（数据保留）
@@ -263,6 +314,31 @@ func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse) {
 		}
 		if now.Sub(e.LastActivity) >= l.opts.EvictTTL {
 			e.Evicted = true
+		}
+	}
+
+	// ③.2 过期条目清理：条目被淘汰、没有待导出增量、且静默超过 prune_ttl 后，
+	// 直接从账本删除，快照随之不再包含它。
+	//
+	// 无损性依据：条目被淘汰时已连续 evict_ttl 没有新增字节，待导出增量为 0 说明
+	// 累计值已经完整导出过（total == lastExported），删除只是丢掉一段「此后没有变化」的
+	// 历史值；若该组合日后重现，会以新基线重新计数，Prometheus 端按新序列处理，
+	// 没有任何已观测字节丢失。
+	// 带待导出增量的条目不删：这些增量在组合重现后仍会被补报（重锚后第二次导出补齐）。
+	for key, e := range l.entries {
+		if !e.Evicted || e.PendingUpload != 0 || e.PendingDownload != 0 {
+			continue
+		}
+		if now.Sub(e.LastActivity) < l.opts.PruneTTL {
+			continue
+		}
+		delete(l.entries, key)
+	}
+
+	// ③.3 墓碑清理：超过 prune_ttl 的消失连接基线不再保留
+	for id, g := range l.gone {
+		if now.Sub(g.lastSeen) >= l.opts.PruneTTL {
+			delete(l.gone, id)
 		}
 	}
 
@@ -283,7 +359,29 @@ func (l *Ledger) Observe(now time.Time, resp *mihomo.ConnectionsResponse) {
 //
 // 导出是写操作：取值后推进「已导出值」并清空「待导出增量」。
 // 重锚后的第一次导出取值等于上次导出值（保持 Prometheus 端计数器连续），待导出增量保留到下一次导出。
+//
+// 排序在锁外完成：锁内只拷贝序列并推进导出状态，避免长时间持锁阻塞采集协程。
 func (l *Ledger) Export() []Series {
+	series := l.collectSeriesLocked()
+
+	sort.Slice(series, func(i, j int) bool {
+		a, b := series[i], series[j]
+		if a.Device != b.Device {
+			return a.Device < b.Device
+		}
+		if a.Site != b.Site {
+			return a.Site < b.Site
+		}
+		if a.Proxy != b.Proxy {
+			return a.Proxy < b.Proxy
+		}
+		return a.Direction < b.Direction
+	})
+	return series
+}
+
+// collectSeriesLocked 在持锁状态下拷贝当前序列并推进导出状态。
+func (l *Ledger) collectSeriesLocked() []Series {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -311,20 +409,6 @@ func (l *Ledger) Export() []Series {
 			Series{Device: key.Device, Site: key.Site, Proxy: key.Proxy, Direction: DirectionDownload, Value: download},
 		)
 	}
-
-	sort.Slice(series, func(i, j int) bool {
-		a, b := series[i], series[j]
-		if a.Device != b.Device {
-			return a.Device < b.Device
-		}
-		if a.Site != b.Site {
-			return a.Site < b.Site
-		}
-		if a.Proxy != b.Proxy {
-			return a.Proxy < b.Proxy
-		}
-		return a.Direction < b.Direction
-	})
 	return series
 }
 
@@ -402,6 +486,9 @@ func (l *Ledger) Restore(st *State) {
 		l.conns[conn.ID] = &conn
 	}
 
+	// 墓碑不入快照：恢复后按「首次出现」处理重现的连接 ID
+	l.gone = make(map[string]goneConn)
+
 	l.globalUploadTotal = st.GlobalUploadTotal
 	l.globalDownloadTotal = st.GlobalDownloadTotal
 	l.globalUploadMax = st.GlobalUploadMax
@@ -447,6 +534,19 @@ func (l *Ledger) ActiveConnections() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.lastActiveConnections
+}
+
+// Connections 返回活跃连接表的副本（按 ID 排序），供只读检查与调试使用。
+func (l *Ledger) Connections() []ConnState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	out := make([]ConnState, 0, len(l.conns))
+	for _, c := range l.conns {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // EntryCount 返回账本条目数。

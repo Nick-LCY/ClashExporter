@@ -1,6 +1,7 @@
 package mihomo
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -197,5 +198,40 @@ func TestNewClientStripsTrailingSlash(t *testing.T) {
 	}
 	if gotPath != "/connections" {
 		t.Errorf("请求路径 = %q, 期望 /connections", gotPath)
+	}
+}
+
+// TestFetchConnectionsRejectsOversizedBody 校验响应体超限时返回明确的超限错误。
+func TestFetchConnectionsRejectsOversizedBody(t *testing.T) {
+	old := responseLimit
+	responseLimit = 1024
+	t.Cleanup(func() { responseLimit = old })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 4096))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "", time.Second)
+	_, err := client.FetchConnections(context.Background())
+	if err == nil {
+		t.Fatal("超限响应体应当返回错误")
+	}
+	if got := err.Error(); !strings.Contains(got, "超过") || !strings.Contains(got, "上限") {
+		t.Errorf("错误信息 = %q, 期望包含超限说明", got)
+	}
+	// 不得退化成 JSON 解析错误
+	if got := err.Error(); strings.Contains(got, "JSON") {
+		t.Errorf("错误信息 = %q, 超限不应报成 JSON 解析错误", got)
+	}
+}
+
+// TestDefaultResponseLimitIs64MB 校验默认上限为 64MB，报错文案明确写出 64MB。
+func TestDefaultResponseLimitIs64MB(t *testing.T) {
+	if responseLimit != 64<<20 {
+		t.Fatalf("默认读取上限 = %d, 期望 64MB", responseLimit)
+	}
+	if got := humanSize(responseLimit); got != "64MB" {
+		t.Errorf("上限文案 = %q, 期望 64MB", got)
 	}
 }

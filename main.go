@@ -58,6 +58,7 @@ func main() {
 	book, err := ledger.New(ledger.Options{
 		SiteCap:       cfg.SiteLabelCap,
 		EvictTTL:      cfg.EvictTTL.Duration(),
+		PruneTTL:      cfg.PruneTTL.Duration(),
 		DeviceAliases: cfg.DeviceAliases,
 		GroupRules:    rules,
 	})
@@ -83,7 +84,7 @@ func main() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
-	srv := httpapi.New(reg, cfg.ListenAddr)
+	srv := httpapi.New(reg, cfg.ListenAddr, book)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("启动 HTTP 服务失败: %v", err)
 	}
@@ -148,31 +149,42 @@ func pollLoop(ctx context.Context, wg *sync.WaitGroup, client *mihomo.Client, bo
 	defer ticker.Stop()
 
 	// 启动即先采一轮，避免启动后第一个周期内指标为空。
-	scrape(ctx, client, book)
+	scrapeRound(ctx, client, book)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scrape(ctx, client, book)
+			scrapeRound(ctx, client, book)
 		}
 	}
 }
 
-// scrape 执行一轮拉取与入账。
-func scrape(ctx context.Context, client *mihomo.Client, book *ledger.Ledger) {
+// scrapeRound 执行一轮拉取与入账，返回本轮是否成功拿到数据并入账。
+//
+// 三条硬规则（均有测试覆盖）：
+//  1. 拉取失败绝不触碰账本：不执行消失检测、不入账、不改任何累计值，只把 up 置为 false；
+//  2. 上下文取消（退出流程）不是拉取失败：不置 up=false、不打错误日志；
+//  3. 只有成功拿到响应才 Observe（增量入账 + 消失检测）。
+func scrapeRound(ctx context.Context, client *mihomo.Client, book *ledger.Ledger) bool {
 	start := time.Now()
 	resp, err := client.FetchConnections(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			// 退出流程导致的取消：不是拉取失败，保持 up 现状
+			log.Printf("拉取被取消（退出流程）: %v", err)
+			return false
+		}
 		log.Printf("拉取 mihomo 连接失败: %v", err)
 		book.SetUp(false)
-		return
+		return false
 	}
 
 	book.Observe(time.Now(), resp)
 	book.SetScrapeDuration(time.Since(start))
 	book.SetUp(true)
+	return true
 }
 
 // snapshotLoop 定时把账本状态原子写盘。
